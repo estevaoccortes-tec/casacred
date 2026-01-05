@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Venv
+venv/
+.venv/
+.vscode/
+
+# Outputs e logs
+logs/
+output/
+*.log
+
+# Dados/entradas/saídas (evita subir documentos/imagens)
+data/
+entrada/
+saidas/
+*.xlsx
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.pdf
