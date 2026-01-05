@@ -25,3 +25,4 @@ saidas/
 *.jpg
 *.jpeg
 *.pdf
+/03_OUTPUT/
