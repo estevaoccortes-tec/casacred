@@ -472,37 +472,32 @@ def infer_start_month(ocr_months: List[datetime | None], fallback_start: datetim
 
     return best_start
 
-# ---------------------------
-# Pipeline principal
-# ---------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("pdf", help="Caminho do PDF")
-    ap.add_argument("--outdir", default="./03_OUTPUT/grafico_final", help="Pasta de saída")
-    ap.add_argument("--dpi", type=int, default=200, help="DPI (200-450). Comece com 200.")
-    ap.add_argument("--poppler", required=True, help="Pasta do Poppler bin (onde tem pdfinfo.exe)")
-    ap.add_argument("--page", type=int, default=0, help="Página 1-based (0 = auto pelo score azul)")
-    ap.add_argument("--tesseract", default="", help="Caminho do tesseract.exe (opcional)")
-    ap.add_argument("--expected-bars", type=int, default=13, help="Quantas barras espera (13 meses)")
-    ap.add_argument("--start-label", default="Nov/2024", help='Fallback de sequência, ex: "Nov/2024"')
-    ap.add_argument("--override", default="", help='Override manual por indice: "3=9,10=8"')
-    args = ap.parse_args()
-
-    pdf_path = Path(args.pdf)
-    outdir = Path(args.outdir)
-    poppler_path = Path(args.poppler)
+def extract_one_pdf(
+    pdf_path: str | Path,
+    outdir: str | Path,
+    dpi: int,
+    poppler: str | Path,
+    page: int,
+    expected_bars: int,
+    start_label: str,
+    override: str,
+    tesseract: str,
+) -> dict:
+    pdf_path = Path(pdf_path)
+    outdir = Path(outdir)
+    poppler_path = Path(poppler)
 
     debug_dir = outdir / "debug"
     ensure_dir(outdir)
     ensure_dir(debug_dir)
 
-    if args.tesseract:
-        pytesseract.pytesseract.tesseract_cmd = args.tesseract
+    if tesseract:
+        pytesseract.pytesseract.tesseract_cmd = tesseract
 
-    pages_rgb = render_pages(pdf_path, dpi=args.dpi, poppler_path=poppler_path)
+    pages_rgb = render_pages(pdf_path, dpi=dpi, poppler_path=poppler_path)
 
-    if args.page and args.page > 0:
-        page_selected = args.page
+    if page and page > 0:
+        page_selected = page
     else:
         page_selected = pick_page_by_blue_score(pages_rgb, debug_dir=debug_dir)
 
@@ -538,8 +533,8 @@ def main():
     bars_roi.sort(key=lambda b: b.x)
 
     # se ainda vier barulho, keep só os N mais “altos”
-    if len(bars_roi) > args.expected_bars:
-        bars_roi = sorted(bars_roi, key=lambda b: b.h, reverse=True)[:args.expected_bars]
+    if len(bars_roi) > expected_bars:
+        bars_roi = sorted(bars_roi, key=lambda b: b.h, reverse=True)[:expected_bars]
         bars_roi.sort(key=lambda b: b.x)
 
     # debug bbox
@@ -599,9 +594,8 @@ def main():
         })
 
     # meses: usa OCR para inferir inicio e gera sequencia consistente
-    dt_fallback = parse_start_label(args.start_label)
+    dt_fallback = parse_start_label(start_label)
     dt0 = infer_start_month(ocr_months, fallback_start=dt_fallback)
-    expected = args.expected_bars
 
     # Se quantidade de barras diferente do esperado, a gente continua mas preenche meses pelo que saiu
     n = len(results)
@@ -611,8 +605,8 @@ def main():
         results[i]["mes_ref"] = mes_ref(months[i])
 
     # Override manual por indice (ordem)
-    if args.override:
-        for item in args.override.split(","):
+    if override:
+        for item in override.split(","):
             item = item.strip()
             if not item:
                 continue
@@ -630,7 +624,7 @@ def main():
     # Export JSON + CSV
     payload = {
         "pdf": str(pdf_path).replace("\\", "/"),
-        "dpi": args.dpi,
+        "dpi": dpi,
         "page_selected": page_selected,
         "bars_detected": len(results),
         "roi_bbox_page": [rx, ry, rw, rh],
@@ -653,12 +647,42 @@ def main():
                 "consultas": r["consultas"] if r["consultas"] is not None else "",
             })
 
-    print(f"OK Página escolhida: {page_selected}")
-    print(f"OK Barras detectadas: {len(results)} (esperado: {expected})")
+    return payload
+
+# ---------------------------
+# Pipeline principal
+# ---------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pdf", help="Caminho do PDF")
+    ap.add_argument("--outdir", default="./03_OUTPUT/grafico_final", help="Pasta de saída")
+    ap.add_argument("--dpi", type=int, default=200, help="DPI (200-450). Comece com 200.")
+    ap.add_argument("--poppler", required=True, help="Pasta do Poppler bin (onde tem pdfinfo.exe)")
+    ap.add_argument("--page", type=int, default=0, help="Página 1-based (0 = auto pelo score azul)")
+    ap.add_argument("--tesseract", default="", help="Caminho do tesseract.exe (opcional)")
+    ap.add_argument("--expected-bars", type=int, default=13, help="Quantas barras espera (13 meses)")
+    ap.add_argument("--start-label", default="Nov/2024", help='Fallback de sequência, ex: "Nov/2024"')
+    ap.add_argument("--override", default="", help='Override manual por indice: "3=9,10=8"')
+    args = ap.parse_args()
+
+    payload = extract_one_pdf(
+        pdf_path=args.pdf,
+        outdir=args.outdir,
+        dpi=args.dpi,
+        poppler=args.poppler,
+        page=args.page,
+        expected_bars=args.expected_bars,
+        start_label=args.start_label,
+        override=args.override,
+        tesseract=args.tesseract,
+    )
+
+    print(f"OK Página escolhida: {payload['page_selected']}")
+    print(f"OK Barras detectadas: {payload['bars_detected']} (esperado: {args.expected_bars})")
     print("OK Salvei:")
-    print(f" - {str(json_path)}")
-    print(f" - {str(csv_path)}")
-    print(f"DIR Debugs em: {str(debug_dir)}")
+    print(f" - {str(Path(args.outdir) / 'consultas_grafico_full.json')}")
+    print(f" - {str(Path(args.outdir) / 'consultas_grafico.csv')}")
+    print(f"DIR Debugs em: {str(Path(args.outdir) / 'debug')}")
 
 
 if __name__ == "__main__":
