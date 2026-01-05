@@ -30,7 +30,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -264,13 +264,49 @@ def preprocess_for_digits(roi_bgr: np.ndarray, mode: str) -> np.ndarray:
 
     return th
 
+def tighten_binary(th_img: np.ndarray) -> np.ndarray:
+    # Tight crop around ink to reduce whitespace before OCR.
+    ys, xs = np.where(th_img < 250)
+    if xs.size == 0 or ys.size == 0:
+        return th_img
+
+    x1, x2 = xs.min(), xs.max() + 1
+    y1, y2 = ys.min(), ys.max() + 1
+    crop = th_img[y1:y2, x1:x2]
+
+    pad = max(4, int(min(crop.shape[:2]) * 0.10))
+    crop = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+
+    h, w = crop.shape[:2]
+    scale = 1
+    if max(h, w) < 80:
+        scale = 2
+    if max(h, w) < 40:
+        scale = 3
+    if scale > 1:
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    return crop
+
+def largest_component(th_img: np.ndarray) -> np.ndarray:
+    # Keep only the largest ink component to reduce noise for OCR.
+    inv = (th_img < 128).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=8)
+    if num_labels <= 1:
+        return th_img
+    idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    mask = (labels == idx).astype(np.uint8)
+    out = np.full(th_img.shape, 255, dtype=np.uint8)
+    out[mask > 0] = 0
+    return out
+
 def ocr_digits(th_img: np.ndarray, psm: int) -> str:
     cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789"
     txt = pytesseract.image_to_string(th_img, config=cfg) or ""
     txt = re.sub(r"\D", "", txt)
     return txt
 
-def best_digit_ocr(roi_bgr: np.ndarray, debug_paths: List[Tuple[str, Path]]) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+def best_digit_ocr(roi_bgr: np.ndarray, debug_paths: List[Tuple[str, Path]]) -> Tuple[int | None, str | None, str | None]:
     """
     Retorna:
       consultas (int | None), raw_ocr (str|None), ocr_mode (str|None)
@@ -284,6 +320,9 @@ def best_digit_ocr(roi_bgr: np.ndarray, debug_paths: List[Tuple[str, Path]]) -> 
         ("adapt_inv", 7),
         ("otsu", 10),      # psm 10 (single char) ajuda muito no "9"
         ("adapt", 10),
+        ("otsu", 8),
+        ("adapt", 8),
+        ("otsu", 13),
     ]
 
     best_txt = ""
@@ -295,13 +334,17 @@ def best_digit_ocr(roi_bgr: np.ndarray, debug_paths: List[Tuple[str, Path]]) -> 
         # pequena morfologia pra reforçar traço do dígito
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         th2 = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k, iterations=1)
-
-        txt = ocr_digits(th2, psm=psm)
+        th3 = tighten_binary(th2)
+        txt = ocr_digits(th3, psm=psm)
+        if not txt:
+            th4 = largest_component(th2)
+            th3 = tighten_binary(th4)
+            txt = ocr_digits(th3, psm=psm)
 
         # debug (salva o threshold que tentou)
         for tag, path in debug_paths:
             if tag == f"{mode}_psm{psm}":
-                save_png(path, th2)
+                save_png(path, th3)
 
         # critério: preferir resultado maior (ex: "13" > "1")
         if len(txt) > len(best_txt):
@@ -314,6 +357,24 @@ def best_digit_ocr(roi_bgr: np.ndarray, debug_paths: List[Tuple[str, Path]]) -> 
         # se já achou 2 dígitos tipo 10/12/13, ótimo
         if len(best_txt) >= 2:
             break
+
+    if not best_txt:
+        # Fallback: stronger upscale + inverted Otsu on raw ROI.
+        gray = cv2.cvtColor(roi_nb, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, None, fx=6, fy=6, interpolation=cv2.INTER_CUBIC)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k, iterations=1)
+        th = 255 - th
+        th = largest_component(th)
+        th = tighten_binary(th)
+
+        for psm in (10, 8, 7):
+            txt = ocr_digits(th, psm=psm)
+            if txt:
+                best_txt = txt
+                best_mode = f"fallback_psm{psm}"
+                break
 
     if not best_txt:
         return None, None, None
@@ -337,7 +398,7 @@ def normalize_month_text(s: str) -> str:
     s = re.sub(r"\s+", "", s)
     return s
 
-def parse_month_label(s: str) -> Optional[datetime]:
+def parse_month_label(s: str) -> datetime | None:
     s2 = normalize_month_text(s).lower()
     m = re.search(r"(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez).*(20\d{2})", s2)
     if not m:
@@ -346,7 +407,7 @@ def parse_month_label(s: str) -> Optional[datetime]:
     year = int(m.group(2))
     return datetime(year, mon, 1)
 
-def ocr_month_under_bar(chart_nb_bgr: np.ndarray, bar: Bar) -> Optional[str]:
+def ocr_month_under_bar(chart_nb_bgr: np.ndarray, bar: Bar) -> str | None:
     """
     Tenta ler label abaixo de cada barra.
     """
@@ -374,6 +435,43 @@ def ocr_month_under_bar(chart_nb_bgr: np.ndarray, bar: Bar) -> Optional[str]:
     return txt
 
 
+
+
+def infer_start_month(ocr_months: List[datetime | None], fallback_start: datetime) -> datetime:
+    # Choose the start month that best matches OCR labels in order.
+    candidates = []
+    for i, dt in enumerate(ocr_months):
+        if dt is None:
+            continue
+        candidates.append((i, dt))
+
+    if not candidates:
+        return fallback_start
+
+    best_start = fallback_start
+    best_score = -1
+    best_exact = -1
+
+    for i, dt in candidates:
+        start = add_months(dt, -i)
+        score = 0
+        exact = 0
+        for j, dtj in enumerate(ocr_months):
+            if dtj is None:
+                continue
+            exp = add_months(start, j)
+            if dtj.year == exp.year and dtj.month == exp.month:
+                score += 2
+                exact += 1
+            elif dtj.month == exp.month:
+                score += 1
+        if score > best_score or (score == best_score and exact > best_exact):
+            best_score = score
+            best_exact = exact
+            best_start = start
+
+    return best_start
+
 # ---------------------------
 # Pipeline principal
 # ---------------------------
@@ -387,6 +485,7 @@ def main():
     ap.add_argument("--tesseract", default="", help="Caminho do tesseract.exe (opcional)")
     ap.add_argument("--expected-bars", type=int, default=13, help="Quantas barras espera (13 meses)")
     ap.add_argument("--start-label", default="Nov/2024", help='Fallback de sequência, ex: "Nov/2024"')
+    ap.add_argument("--override", default="", help='Override manual por indice: "3=9,10=8"')
     args = ap.parse_args()
 
     pdf_path = Path(args.pdf)
@@ -454,6 +553,7 @@ def main():
     save_png(debug_dir / "roi_no_blue.png", chart_nb)
 
     results = []
+    ocr_months: List[datetime | None] = []
     for idx, b in enumerate(bars_roi):
         # ROI acima da barra: (muito importante pro "9")
         H, W = chart_nb.shape[:2]
@@ -484,6 +584,7 @@ def main():
         # tenta OCR do mês (opcional)
         mtxt = ocr_month_under_bar(chart_nb, b)
         mdt = parse_month_label(mtxt) if mtxt else None
+        ocr_months.append(mdt)
 
         results.append({
             "ordem": idx,
@@ -497,18 +598,34 @@ def main():
             "roi_bbox_page": [rx, ry, rw, rh],
         })
 
-    # meses fallback: se não conseguiu ler meses, gera sequência
-    # (ou se leu poucos, também gera e preenche tudo)
-    dt0 = parse_start_label(args.start_label)
+    # meses: usa OCR para inferir inicio e gera sequencia consistente
+    dt_fallback = parse_start_label(args.start_label)
+    dt0 = infer_start_month(ocr_months, fallback_start=dt_fallback)
     expected = args.expected_bars
 
     # Se quantidade de barras diferente do esperado, a gente continua mas preenche meses pelo que saiu
     n = len(results)
     months = [add_months(dt0, i) for i in range(n)]
     for i in range(n):
-        if results[i]["mes"] is None or results[i]["mes_ref"] is None:
-            results[i]["mes"] = fmt_label(months[i])
-            results[i]["mes_ref"] = mes_ref(months[i])
+        results[i]["mes"] = fmt_label(months[i])
+        results[i]["mes_ref"] = mes_ref(months[i])
+
+    # Override manual por indice (ordem)
+    if args.override:
+        for item in args.override.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError('Formato de --override invalido. Use "3=9,10=8".')
+            idx_str, val_str = item.split("=", 1)
+            idx = int(idx_str.strip())
+            val = int(val_str.strip())
+            if idx < 0 or idx >= len(results):
+                raise ValueError(f"Indice de override fora do range: {idx}")
+            results[idx]["consultas"] = val
+            results[idx]["raw_ocr"] = str(val)
+            results[idx]["ocr_mode"] = "manual"
 
     # Export JSON + CSV
     payload = {
@@ -536,12 +653,12 @@ def main():
                 "consultas": r["consultas"] if r["consultas"] is not None else "",
             })
 
-    print(f"✅ Página escolhida: {page_selected}")
-    print(f"✅ Barras detectadas: {len(results)} (esperado: {expected})")
-    print("✅ Salvei:")
+    print(f"OK Página escolhida: {page_selected}")
+    print(f"OK Barras detectadas: {len(results)} (esperado: {expected})")
+    print("OK Salvei:")
     print(f" - {str(json_path)}")
     print(f" - {str(csv_path)}")
-    print(f"📁 Debugs em: {str(debug_dir)}")
+    print(f"DIR Debugs em: {str(debug_dir)}")
 
 
 if __name__ == "__main__":
