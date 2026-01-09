@@ -25,4 +25,6 @@ saidas/
 *.jpg
 *.jpeg
 *.pdf
+/01_INPUT/
 /03_OUTPUT/
+/05_LOGS/

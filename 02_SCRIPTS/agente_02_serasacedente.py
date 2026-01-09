@@ -1,6 +1,8 @@
+import argparse
 import os
 import re
 import csv
+import unicodedata
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +30,7 @@ PT_MONTHS = {
     "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12
 }
 INV_PT = {v: k for k, v in PT_MONTHS.items()}
+DATE_RE = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
 
 def parse_start_label(label: str) -> datetime:
     s = (label or "").strip().lower()
@@ -529,13 +532,162 @@ def extract_one_pdf(
 
     return payload
 
-def extrair_dados_estritos():
-    if not os.path.exists(PASTA_DESTINO): os.makedirs(PASTA_DESTINO)
-    
-    pastas = [d for d in os.listdir(PASTA_INPUT) if os.path.isdir(os.path.join(PASTA_INPUT, d))]
-    
-    for empresa in pastas:
-        caminho_pasta = os.path.join(PASTA_INPUT, empresa)
+def _resolve_empresas(input_dir: str):
+    subdirs = [d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))]
+    if subdirs:
+        return [(d, os.path.join(input_dir, d)) for d in subdirs]
+    return [(os.path.basename(input_dir), input_dir)]
+
+
+def _strip_accents(s: str) -> str:
+    s = s or ""
+    s = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+
+def _extract_anotacoes_block(texto_total: str) -> str:
+    up = _strip_accents(texto_total).upper()
+    m_neg = re.search(
+        r"ANOTACOES\s+NEGATIVAS(.+?)(?:QUADRO\s+SOCIETARIO|CONSULTAS\s+A\s+SERASA|LIMITE\s+DE\s+CREDITO|SERASA\s+SCORE|$)",
+        up,
+        flags=re.S,
+    )
+    return m_neg.group(1) if m_neg else ""
+
+
+def _extract_cheque_motivo(texto_total: str) -> Optional[str]:
+    up = _strip_accents(texto_total).upper()
+    m = re.search(
+        r"CHEQUES?\s+SUSTADOS?(.*?)(?:CONSULTAS\s+A\s+SERASA|LIMITE\s+DE\s+CREDITO|SERASA\s+SCORE|$)",
+        up,
+        flags=re.S,
+    )
+    bloco = m.group(1) if m else ""
+    if not bloco:
+        return None
+
+    if "NENHUM REGISTRO" in bloco or "SEM REGISTROS" in bloco or "SEM REGISTRO" in bloco:
+        return None
+
+    if not re.search(r"\d{2}/\d{2}/\d{4}", bloco) and "R$" not in bloco:
+        return None
+
+    motivos = [
+        "EXTRAVIADO DO RECHEQUE",
+        "EXTRAVIADO",
+        "SUSTADO",
+        "DEVOLVIDO",
+        "SEM FUNDOS",
+        "ALINEA",
+    ]
+    for m in motivos:
+        if m in bloco:
+            return m.title()
+
+    return None
+
+
+def _clean_consultante(raw: str) -> str:
+    s = (raw or "").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+\d{1,4}$", "", s).strip()
+    return s.strip(" -")
+
+
+def _extract_consultas_block(texto_total: str) -> str:
+    if not texto_total:
+        return ""
+    m = re.search(
+        r"CONSULTAS?.{0,40}(?:A\s+SERASA)?\s*(.+?)(?:CHEQUES|ANOTACOES|QUADRO\s+SOCIETARIO|LIMITE\s+DE\s+CREDITO|SERASA\s+SCORE|$)",
+        texto_total,
+        flags=re.IGNORECASE | re.S,
+    )
+    return m.group(1) if m else ""
+
+
+def _extract_consultas_tabela_text(texto_total: str) -> List[Tuple[str, str]]:
+    bloco = _extract_consultas_block(texto_total)
+    if not bloco:
+        return []
+
+    lines = [_clean_consultante(l) for l in (bloco.splitlines() or [])]
+    results: List[Tuple[str, str]] = []
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        m = DATE_RE.search(line)
+        if not m:
+            continue
+        date = m.group(0)
+        rest = _clean_consultante(line[m.end() :])
+        if not rest:
+            j = i + 1
+            while j < len(lines) and not lines[j]:
+                j += 1
+            if j < len(lines):
+                rest = _clean_consultante(lines[j])
+        if rest:
+            results.append((date, rest))
+
+    seen = set()
+    out: List[Tuple[str, str]] = []
+    for d, n in results:
+        key = f"{d}|{n}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((d, n))
+    return out
+
+
+def _extract_consultas_tabela_ocr(pdf_full_path: str) -> List[Tuple[str, str]]:
+    poppler_path = Path(POPPLER_PATH)
+    if not poppler_path.exists():
+        return []
+
+    try:
+        images = convert_from_path(
+            pdf_full_path,
+            dpi=300,
+            poppler_path=str(poppler_path),
+            fmt="png",
+        )
+    except Exception:
+        return []
+
+    results: List[Tuple[str, str]] = []
+    for img in images:
+        txt = pytesseract.image_to_string(img, lang="por+eng", config="--oem 3 --psm 6") or ""
+        for line in (txt.splitlines() or []):
+            line = _clean_consultante(line)
+            if not line:
+                continue
+            m = DATE_RE.search(line)
+            if not m:
+                continue
+            date = m.group(0)
+            rest = _clean_consultante(line[m.end() :])
+            if rest:
+                results.append((date, rest))
+
+    seen = set()
+    out: List[Tuple[str, str]] = []
+    for d, n in results:
+        key = f"{d}|{n}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((d, n))
+    return out
+
+
+def extrair_dados_estritos(input_dir: str, out_dir: str):
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    pastas = _resolve_empresas(input_dir)
+
+    for empresa, caminho_pasta in pastas:
         arquivo_pdf = next((f for f in os.listdir(caminho_pasta) if "serasa" in f.lower() and "cedente" in f.lower() and f.endswith(".pdf")), None)
         if not arquivo_pdf: continue
 
@@ -565,7 +717,8 @@ def extrair_dados_estritos():
         campos_finais.append(("Nome fantasia", buscar_fantasia()))
         campos_finais.append(("Fundação", "14/01/2019"))
         
-        liminar = "Sim" if ("Sem ocorrências" in texto_total or "NADA CONSTA" in texto_total) else "Sem registro"
+        anot_block = _extract_anotacoes_block(texto_total)
+        liminar = "Sim" if "NADA CONSTA" in anot_block else "Sem registro"
         campos_finais.append(("Liminar", liminar))
         
         campos_finais.append(("Serasa Score", "284"))
@@ -584,39 +737,80 @@ def extrair_dados_estritos():
                         if not table or not table[0]:
                             continue
                         header = " ".join([c or "" for c in table[0]]).lower()
-                        if "data da consulta" not in header or "nome do consultante" not in header:
+                        if "data da consulta" not in header:
+                            continue
+                        if "nome do consultante" not in header and "segmento do consultante" not in header:
                             continue
                         for row in table[1:]:
-                            if not row or not row[0]:
+                            if not row:
                                 continue
-                            data = (row[0] or "").strip()
-                            nome = (row[1] or "").replace("\n", " ").strip()
-                            if re.match(r"\d{2}/\d{2}/\d{4}", data) and nome:
-                                resultados.append((data, nome))
+                            cells = [(c or "").strip() for c in row]
+                            date = None
+                            for c in cells:
+                                m = DATE_RE.search(c)
+                                if m:
+                                    date = m.group(0)
+                                    break
+                            if not date:
+                                continue
+                            consultante = ""
+                            for c in reversed(cells):
+                                if not c:
+                                    continue
+                                if DATE_RE.search(c):
+                                    continue
+                                if re.search(r"[A-Za-zÁÉÍÓÚÂÊÔÃÕÇ]", c):
+                                    consultante = c
+                                    break
+                            consultante = _clean_consultante(consultante)
+                            if consultante:
+                                resultados.append((date, consultante))
                         if resultados:
                             return resultados
             return resultados
 
         pdf_full_path = os.path.join(caminho_pasta, arquivo_pdf)
         consultantes = extrair_consultas_tabela(pdf_full_path)
+        if len(consultantes) < 5:
+            extra = _extract_consultas_tabela_text(texto_total)
+            if extra:
+                seen = set()
+                merged: List[Tuple[str, str]] = []
+                for d, n in consultantes + extra:
+                    key = f"{d}|{n}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append((d, n))
+                consultantes = merged
+        if len(consultantes) < 5:
+            extra_ocr = _extract_consultas_tabela_ocr(pdf_full_path)
+            if extra_ocr:
+                seen = set()
+                merged: List[Tuple[str, str]] = []
+                for d, n in consultantes + extra_ocr:
+                    key = f"{d}|{n}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append((d, n))
+                consultantes = merged
+
+        if len(consultantes) < 5:
+            raise RuntimeError("ERRO: Consultas insuficientes no SERASA CEDENTE (esperado 5).")
         for i in range(1, 6):
-            if len(consultantes) >= i:
-                data, nome = consultantes[i - 1]
-                campos_finais.append((f"Consulta {i}", f"{data} - {nome}"))
-            else:
-                campos_finais.append((f"Consulta {i}", "Sem registro"))
+            data, nome = consultantes[i - 1]
+            campos_finais.append((f"Consulta {i}", f"{data} - {nome}"))
 
         # 3. CHEQUES (LINHA FIXA)
-        # Verificamos se existe o termo SUSTADO associado a uma data real
-        if "SUSTADO" in texto_total and re.search(r"SUSTADO.*?\d{2}/\d{2}/\d{4}", texto_total, re.S):
-            campos_finais.append(("Cheques - Motivo", "SUSTADO"))
-        else:
-            campos_finais.append(("Cheques - Motivo", "Sem registro"))
+        cheque_motivo = _extract_cheque_motivo(texto_total)
+        if cheque_motivo:
+            campos_finais.append(("Cheques - Motivo", cheque_motivo))
 
         # 4. GRÁFICO (CONSULTAS MENSAIS) - usando OCR do extrair_grafico_serasa.py
         try:
             pdf_full_path = os.path.join(caminho_pasta, arquivo_pdf)
-            out_graf = os.path.join(PASTA_DESTINO, "_debug_grafico", empresa)
+            out_graf = os.path.join(out_dir, "_debug_grafico", empresa)
             payload = extract_one_pdf(
                 pdf_path=pdf_full_path,
                 outdir=out_graf,
@@ -649,8 +843,12 @@ def extrair_dados_estritos():
         df_final["CNPJ"] = cnpj
         
         nome_excel = arquivo_pdf.replace(".pdf", ".xlsx")
-        df_final.to_excel(os.path.join(PASTA_DESTINO, nome_excel), index=False)
+        df_final.to_excel(os.path.join(out_dir, nome_excel), index=False)
         print(f"Arquivo Estruturado Gerado: {nome_excel}")
 
 if __name__ == "__main__":
-    extrair_dados_estritos()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default=PASTA_INPUT, help="Pasta base 01_INPUT (ou pasta da empresa).")
+    ap.add_argument("--outdir", default=PASTA_DESTINO, help="Pasta de saida.")
+    args = ap.parse_args()
+    extrair_dados_estritos(args.input, args.outdir)
